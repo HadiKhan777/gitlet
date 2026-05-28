@@ -17,9 +17,9 @@ function objectPath(hash) {
 }
 
 function writeObject(type, content) {
-  const data   = Buffer.from(content)
-  const header = `${type} ${data.length}\0`
-  const full   = Buffer.concat([Buffer.from(header), data])
+  const data   = Buffer.isBuffer(content) ? content : Buffer.from(content)
+  const header = Buffer.from(`${type} ${data.length}\0`)
+  const full   = Buffer.concat([header, data])
   const hash   = sha256(full)
   const p      = objectPath(hash)
   if (!fs.existsSync(p)) {
@@ -35,14 +35,68 @@ function readObject(hash) {
   const header = full.slice(0, nullAt).toString()
   const [type] = header.split(' ')
   const data   = full.slice(nullAt + 1)
-  return { type, data: data.toString() }
+  return { type, data: data.toString(), rawData: data }
 }
 
 // ── Object types ──────────────────────────────────────────────────────────────
 
 function writeBlob(filePath) {
-  const content = fs.readFileSync(filePath, 'utf8')
+  const content = fs.readFileSync(filePath)
   return writeObject('blob', content)
+}
+
+// Build a nested tree from a flat {filepath: hash} index.
+// Recursively creates subtree objects for each directory level.
+function buildTree(index) {
+  function buildNode(entries) {
+    const dirMap  = {}  // dirname -> [[relpath, hash], ...]
+    const fileMap = {}  // name    -> hash
+
+    for (const [filepath, hash] of entries) {
+      const slash = filepath.indexOf('/')
+      if (slash === -1) {
+        fileMap[filepath] = hash
+      } else {
+        const dir  = filepath.slice(0, slash)
+        const rest = filepath.slice(slash + 1)
+        if (!dirMap[dir]) dirMap[dir] = []
+        dirMap[dir].push([rest, hash])
+      }
+    }
+
+    const treeEntries = []
+    for (const [dir, subEntries] of Object.entries(dirMap)) {
+      const subTreeHash = buildNode(subEntries)
+      treeEntries.push({ mode: '040000', name: dir, hash: subTreeHash })
+    }
+    for (const [name, hash] of Object.entries(fileMap)) {
+      treeEntries.push({ mode: '100644', name, hash })
+    }
+    return writeTree(treeEntries)
+  }
+
+  const entries = Object.entries(index)
+  if (!entries.length) return writeTree([])
+  // Normalise path separators to forward slash
+  const normalised = entries.map(([p, h]) => [p.split(path.sep).join('/'), h])
+  return buildNode(normalised)
+}
+
+// Recursively read a nested tree and return flat {filepath: hash}.
+function flattenTree(treeHash, prefix) {
+  prefix = prefix || ''
+  const result  = {}
+  const entries = readTree(treeHash)
+  for (const entry of entries) {
+    const fullPath = prefix ? `${prefix}/${entry.name}` : entry.name
+    if (entry.mode === '040000') {
+      const sub = flattenTree(entry.hash, fullPath)
+      Object.assign(result, sub)
+    } else {
+      result[fullPath] = entry.hash
+    }
+  }
+  return result
 }
 
 function writeTree(entries) {
@@ -65,31 +119,82 @@ function readTree(hash) {
   })
 }
 
-function writeCommit({ tree, parent, message, author }) {
-  const ts      = new Date().toISOString()
-  const content = [
+// Accept both single parent (backwards compat) and parentList: [hash, ...]
+function writeCommit({ tree, parent, parentList, message, author }) {
+  const parents = parentList
+    ? parentList
+    : parent
+      ? [parent]
+      : []
+
+  const ts    = new Date().toISOString()
+  const lines = [
     `tree ${tree}`,
-    parent ? `parent ${parent}` : null,
+    ...parents.map(p => `parent ${p}`),
     `author ${author || 'unknown'}`,
     `date ${ts}`,
     '',
     message,
-  ].filter(l => l !== null).join('\n')
-  return writeObject('commit', content)
+  ]
+  return writeObject('commit', lines.join('\n'))
 }
 
 function readCommit(hash) {
   const { data } = readObject(hash)
   const lines    = data.split('\n')
-  const meta     = {}
+  const meta     = { parents: [] }
   let   i        = 0
-  while (lines[i] !== '' && i < lines.length) {
-    const sp   = lines[i].indexOf(' ')
-    meta[lines[i].slice(0, sp)] = lines[i].slice(sp + 1)
+  while (i < lines.length && lines[i] !== '') {
+    const sp  = lines[i].indexOf(' ')
+    const key = lines[i].slice(0, sp)
+    const val = lines[i].slice(sp + 1)
+    if (key === 'parent') {
+      meta.parents.push(val)
+    } else {
+      meta[key] = val
+    }
     i++
   }
+  // Backwards-compat: expose first parent as meta.parent
+  meta.parent  = meta.parents[0] || null
   meta.message = lines.slice(i + 1).join('\n').trim()
   return meta
 }
 
-module.exports = { sha256, writeBlob, writeTree, readTree, writeCommit, readCommit, readObject }
+// BFS walk — returns array of all reachable commit hashes starting from hash
+function commitHistory(hash) {
+  const visited = new Set()
+  const queue   = [hash]
+  const result  = []
+  while (queue.length) {
+    const cur = queue.shift()
+    if (!cur || visited.has(cur)) continue
+    visited.add(cur)
+    result.push(cur)
+    try {
+      const c = readCommit(cur)
+      for (const p of c.parents) queue.push(p)
+    } catch (_) {}
+  }
+  return result
+}
+
+// Returns true if ancestorHash is reachable from descendantHash
+function isAncestor(ancestorHash, descendantHash) {
+  const history = commitHistory(descendantHash)
+  return history.includes(ancestorHash)
+}
+
+module.exports = {
+  sha256,
+  writeBlob,
+  buildTree,
+  flattenTree,
+  writeTree,
+  readTree,
+  writeCommit,
+  readCommit,
+  readObject,
+  commitHistory,
+  isAncestor,
+}
